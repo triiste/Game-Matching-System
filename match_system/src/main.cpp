@@ -8,6 +8,12 @@
 #include <thrift/transport/TBufferTransports.h>
 
 #include<iostream>
+#include<thread>
+#include<mutex>
+#include<condition_variable>
+#include<queue>
+#include<vector>
+
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
@@ -17,25 +23,105 @@ using namespace  ::match_service;
 using namespace std; //多人合作时候最后不要加，容易产生冲突
 
 
+struct Task{
+    User user;
+    string type;
+};
+
+struct MessageQueue{ //消息队列
+    queue<Task> q;
+    mutex m; //实现互斥
+    condition_variable cv;//实现同步
+}message_queue;
+
+class Pool
+{
+    public:
+        void save_result(int a,int b){
+            printf("Match Result: %d %d\n",a,b);
+        }
+        void add(User user)
+        {
+            users.push_back(user);
+        }
+        void remove(User user)
+        {
+            for(uint32_t i=0;i<users.size();i++)
+            {
+                if(users[i].id == user.id)
+                {
+                    users.erase(users.begin()+i);
+                    break;
+                }
+            }
+        }
+        void match(){
+            while(users.size() > 1){
+                auto a=users[0],b=users[1];
+                users.erase(users.begin());
+                users.erase(users.begin());
+                save_result(a.id,b.id);
+            }
+        }
+
+    private:
+        vector<User> users;
+}pool;
+
+
 class MatchHandler : virtual public MatchIf {
  public:
   MatchHandler() {
     // Your initialization goes here
   }
-
+    //add和remove互斥访问
   int32_t add_user(const User& user, const std::string& info) {
     // Your implementation goes here
     printf("add_user\n");
+    
+    unique_lock<mutex> lck(message_queue.m);//用锁把它锁起来，变量作用域消失会自动解锁
+    message_queue.q.push({user,"add"});
+    //唤醒锁
+    message_queue.cv.notify_all();
     return 0;
   }
 
   int32_t remove_user(const User& user, const std::string& info) {
     // Your implementation goes here
     printf("remove_user\n");
+
+    unique_lock<mutex> lck(message_queue.m);
+    message_queue.q.push({user,"remove"});
+    message_queue.cv.notify_all(); //唤醒阻塞线程
     return 0;
   }
 
 };
+//生产者-消费者模型
+void consume_task(){
+    //对队列操作是共享的，操作完队列就解锁
+    while(true)
+    {   //队列存的是任务,不是user
+        unique_lock<mutex> lck(message_queue.m);
+        if(message_queue.q.empty()){
+            //游戏刚上线大概率没人，如果没人来 应该把线程阻塞住，直到有新的玩家来在执行
+            message_queue.cv.wait(lck); //先将锁释放掉，然后卡住 
+        }
+        else
+        {
+            auto task = message_queue.q.front();
+            message_queue.q.pop();
+            lck.unlock();   //操作完记得解锁
+            //do task
+            //玩家池
+            if(task.type == "add") pool.add(task.user);
+            else if(task.type == "remove") pool.remove(task.user);
+
+            pool.match();
+
+        }
+    }
+}
 
 int main(int argc, char **argv) {
   int port = 9090;
@@ -47,6 +133,12 @@ int main(int argc, char **argv) {
 
   TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
   cout<<"Start Match Server"<<endl;
+  //多线程 一堆消费者的线程和一堆生产者的线程
+  //生产者和消费者之间需要通信的媒介
+  //c++实现的消息队列(自己实现一个消息队列)
+  //信号量机制 锁有两个操作 一个p操作争取锁  一个v操作放开锁(保证同时只有一个进程写这个队列)
+  //条件变量 对锁进行了一个封装
+  thread matching_thread(consume_task);
   server.serve();
   return 0;
 }
